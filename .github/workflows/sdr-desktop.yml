@@ -88,7 +88,7 @@ jobs:
       matrix:
         job:
           - { target: x86_64-apple-darwin, os: macos-15-intel, extra-build-args: "", arch: x86_64 }
-          - { target: aarch64-apple-darwin, os: macos-14, extra-build-args: "--screencapturekit", arch: aarch64 }
+          - { target: aarch64-apple-darwin, os: macos-15, extra-build-args: "--screencapturekit", arch: aarch64 }
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
@@ -186,7 +186,7 @@ jobs:
 
   macos-universal:
     name: macOS universal app, DMG and QuickSupport zip
-    runs-on: macos-14
+    runs-on: macos-15
     needs: [build-macos]
     steps:
       - name: Download apps
