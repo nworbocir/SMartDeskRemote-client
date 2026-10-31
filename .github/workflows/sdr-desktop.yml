@@ -1,0 +1,437 @@
+# SMartDeskRemote macOS + Linux client build (GitHub Actions).
+# Adapted from upstream RustDesk .github/workflows/flutter-build.yml (same toolchain pins),
+# without code signing or release publishing. Run it from the Actions tab or `gh workflow run`.
+# Produces one artifact, sdr-desktop-<version>, holding:
+#   SMartDeskRemote-<version>.dmg                  universal macOS app (Apple silicon + Intel), ad-hoc signed
+#   SMartDeskRemote-QuickSupport-macOS.zip         the same app zipped, for browser support sessions
+#   SMartDeskRemote-<version>-x86_64.deb           Debian / Ubuntu package
+#   SMartDeskRemote-<version>-x86_64.AppImage      any distribution; also the Linux QuickSupport
+# Copy them to dist\macos and dist\linux, then compile installer\server.iss.
+name: SMartDeskRemote desktop clients (macOS + Linux)
+
+on:
+  workflow_dispatch:
+
+env:
+  SDR_VERSION: "1.0.0.3"
+  VERSION: "1.5.1" # RustDesk protocol version (Cargo.toml) — never the product version
+  RUST_VERSION: "1.75"
+  MAC_RUST_VERSION: "1.81"
+  FLUTTER_VERSION: "3.24.5"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  APPIMAGETOOL_VERSION: "1.9.0"
+
+jobs:
+  generate-bridge:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: bridge-ubuntu-22.04
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: "3.22.3"
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+          # Flutter 3.22.3 (used only for code generation) needs the older extended_text.
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+
+      - name: Run flutter rust bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  build-macos:
+    name: macOS ${{ matrix.job.arch }}
+    runs-on: ${{ matrix.job.os }}
+    needs: [generate-bridge]
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { target: x86_64-apple-darwin, os: macos-15-intel, extra-build-args: "", arch: x86_64 }
+          - { target: aarch64-apple-darwin, os: macos-14, extra-build-args: "--screencapturekit", arch: aarch64 }
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build runtime
+        run: |
+          brew install llvm create-dmg
+          command -v pkg-config >/dev/null || brew install pkg-config
+
+      - name: Install NASM
+        run: |
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: ${{ matrix.job.os }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do echo "$_1:"; cat "$_1"; done
+            exit 1
+          fi
+
+      - name: Build SMartDeskRemote
+        run: |
+          if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
+            MIN_MACOS_VERSION="12.3"
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+            sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+            echo "MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}" >> "$GITHUB_ENV"
+          fi
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra-build-args }}
+          APP=./flutter/build/macos/Build/Products/Release/SMartDeskRemote.app
+          test -d "$APP"
+          perl -e 'alarm 120; exec @ARGV' "$APP/Contents/MacOS/SMartDeskRemote" --version || echo "::warning::--version did not answer"
+          # ditto keeps the framework symlinks (artifact upload alone would not).
+          ditto -c -k --keepParent "$APP" "SMartDeskRemote-${{ matrix.job.arch }}.app.zip"
+
+      - name: Upload app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-app-${{ matrix.job.arch }}
+          path: SMartDeskRemote-${{ matrix.job.arch }}.app.zip
+          if-no-files-found: error
+
+  macos-universal:
+    name: macOS universal app, DMG and QuickSupport zip
+    runs-on: macos-14
+    needs: [build-macos]
+    steps:
+      - name: Download apps
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: macos-app-*
+          merge-multiple: true
+          path: apps
+
+      - name: Merge into one universal app
+        run: |
+          set -euo pipefail
+          brew install create-dmg
+          mkdir -p arm x86 out
+          ditto -x -k apps/SMartDeskRemote-aarch64.app.zip arm
+          ditto -x -k apps/SMartDeskRemote-x86_64.app.zip x86
+          APP=arm/SMartDeskRemote.app
+          X86=x86/SMartDeskRemote.app
+          # Every single-arch Mach-O file gets the x86_64 slice from the Intel build.
+          missing=0
+          while IFS= read -r -d '' f; do
+            file -b "$f" | grep -q 'Mach-O' || continue
+            rel="${f#$APP/}"
+            archs="$(lipo -archs "$f")"
+            case " $archs " in *" x86_64 "*) continue ;; esac
+            if [ ! -f "$X86/$rel" ]; then echo "::error::no x86_64 build of $rel"; missing=1; continue; fi
+            lipo -create "$f" "$X86/$rel" -output "$f.universal"
+            mv "$f.universal" "$f"
+            echo "merged $rel: $(lipo -archs "$f")"
+          done < <(find "$APP" -type f -print0)
+          [ "$missing" = 0 ]
+          # Intel Macs from macOS 10.14; the Apple silicon slice uses ScreenCaptureKit (12.3+).
+          PL="$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion 10.14" "$PL"
+          /usr/libexec/PlistBuddy -c "Delete :LSMinimumSystemVersionByArchitecture" "$PL" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture dict" "$PL"
+          /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture:arm64 string 12.3" "$PL"
+          /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture:x86_64 string 10.14" "$PL"
+          # Unsigned distribution: ad-hoc signature (required on Apple silicon).
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          lipo -archs "$APP/Contents/MacOS/SMartDeskRemote"
+          perl -e 'alarm 120; exec @ARGV' "$APP/Contents/MacOS/SMartDeskRemote" --version || echo "::warning::--version did not answer"
+          perl -e 'alarm 120; exec @ARGV' arch -x86_64 "$APP/Contents/MacOS/SMartDeskRemote" --version || echo "::warning::could not test the x86_64 slice (Rosetta)"
+          CREATE_DMG="$(readlink -f "$(command -v create-dmg)")"
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG" || true
+          create-dmg --volname "SMartDeskRemote" --window-size 800 400 --icon-size 100 \
+            --icon "SMartDeskRemote.app" 200 190 --hide-extension "SMartDeskRemote.app" \
+            --app-drop-link 600 185 "out/SMartDeskRemote-${SDR_VERSION}.dmg" "$APP"
+          # QuickSupport: the server renames the top-level .app folder per session.
+          ditto -c -k --norsrc --noextattr --keepParent "$APP" out/SMartDeskRemote-QuickSupport-macOS.zip
+          unzip -l out/SMartDeskRemote-QuickSupport-macOS.zip | head -5
+          ls -l out
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-release
+          path: out/*
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux x86_64 (.deb)
+    runs-on: ubuntu-22.04
+    needs: [generate-bridge]
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /opt/ghc /usr/local/lib/android /usr/share/dotnet
+          sudo apt-get update -y
+          sudo apt-get install -y nasm qemu-user-static
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c # v1.0
+        with:
+          swap-size-gb: 12
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: "rustfmt"
+
+      - name: Save Rust toolchain version
+        run: echo "RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')" >> $GITHUB_ENV
+
+      - name: Disable rust bridge build
+        run: sed -i "s/\[\"cdylib\", \"staticlib\", \"rlib\"\]/\[\"cdylib\"\]/g" Cargo.toml
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          sudo apt install -y libva-dev
+          if ! $VCPKG_ROOT/vcpkg install --triplet x64-linux --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do echo "$_1:"; cat "$_1"; done
+            exit 1
+          fi
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      # Ubuntu 18.04 container: the binaries then run on every distribution with glibc 2.27+.
+      - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
+        name: Build SMartDeskRemote
+        with:
+          arch: x86_64
+          distro: ubuntu18.04
+          githubToken: ${{ github.token }}
+          dockerRunArgs: |
+            --volume "${PWD}:/workspace"
+            --volume "/opt/artifacts:/opt/artifacts"
+          shell: /bin/bash
+          install: |
+            apt-get update -y
+            apt-get install -y build-essential clang cmake curl gcc git g++ libayatana-appindicator3-dev \
+              libasound2-dev libclang-10-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgtk-3-dev \
+              libpulse-dev libva-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev \
+              libxfixes-dev llvm-10-dev nasm ninja-build pkg-config tree python3 rpm unzip wget xz-utils libssl-dev
+            apt-get remove -y libopus-dev || true
+          run: |
+            set -e
+            git config --global --add safe.directory "*"
+            pushd /opt
+            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{ env.RUST_TOOLCHAIN_VERSION }}-x86_64-unknown-linux-gnu.tar.gz
+            tar -zxf rust.tar.gz && rm rust.tar.gz
+            cd rust-${{ env.RUST_TOOLCHAIN_VERSION }}-x86_64-unknown-linux-gnu && ./install.sh
+            popd
+            pushd /workspace
+            export VCPKG_ROOT=/opt/artifacts/vcpkg
+            cargo build --locked --lib --features hwcodec,flutter,unix-file-copy-paste --release
+            rm -rf target/release/deps target/release/build ~/.cargo
+            popd
+            pushd /opt
+            wget -q https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            export PATH=/opt/flutter/bin:$PATH
+            flutter doctor -v
+            pushd /opt/flutter
+            git apply /workspace/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+            popd
+            popd
+            pushd /workspace
+            export CARGO_INCREMENTAL=0
+            export DEB_ARCH=amd64
+            export SDR_VERSION=${{ env.SDR_VERSION }}
+            python3 ./build.py --flutter --skip-cargo
+            mv rustdesk-${{ env.VERSION }}.deb SMartDeskRemote-${{ env.SDR_VERSION }}-x86_64.deb
+
+      - name: Check package
+        run: |
+          dpkg-deb -I SMartDeskRemote-${SDR_VERSION}-x86_64.deb
+          dpkg-deb -c SMartDeskRemote-${SDR_VERSION}-x86_64.deb | grep -E "usr/share/rustdesk/rustdesk$|lib/librustdesk.so"
+
+      - name: Upload deb
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-deb
+          path: SMartDeskRemote-${{ env.SDR_VERSION }}-x86_64.deb
+          if-no-files-found: error
+
+  build-appimage:
+    name: Linux x86_64 (AppImage)
+    runs-on: ubuntu-22.04
+    needs: [build-linux]
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download deb
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: linux-deb
+          path: .
+
+      - name: Build AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv SMartDeskRemote-${SDR_VERSION}-x86_64.deb appimage/rustdesk.deb
+          sudo apt-get update -y
+          sudo apt-get install -y libarchive-tools libfuse2
+          sudo pip3 install "setuptools_scm<10"
+          sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
+          pushd appimage
+          sed -i -e "s/^    name: rustdesk$/    name: SMartDeskRemote/" -e "s/^    version: ${VERSION}$/    version: ${SDR_VERSION}/" AppImageBuilder-x86_64.yml
+          ./build-apprun.sh x86_64
+          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-x86_64.yml
+          built="$(ls ./*.AppImage | head -1)"
+          # Repack with the static type2 runtime, which needs no libfuse2 (absent on Ubuntu 24.04+).
+          sudo rm -rf squashfs-root
+          "$built" --appimage-extract >/dev/null
+          wget -q -O appimagetool "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage" \
+            || wget -q -O appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+          out="../SMartDeskRemote-${SDR_VERSION}-x86_64.AppImage"
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run -n squashfs-root "$out"
+          popd
+          chmod +x "SMartDeskRemote-${SDR_VERSION}-x86_64.AppImage"
+          ls -l SMartDeskRemote-*.AppImage
+          ./SMartDeskRemote-${SDR_VERSION}-x86_64.AppImage --appimage-extract-and-run --version || echo "::warning::could not run --version"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-appimage
+          path: SMartDeskRemote-${{ env.SDR_VERSION }}-x86_64.AppImage
+          if-no-files-found: error
+
+  bundle:
+    name: Bundle for the server installer
+    runs-on: ubuntu-22.04
+    needs: [macos-universal, build-linux, build-appimage]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: in
+      - run: |
+          set -euo pipefail
+          mkdir -p out/macos out/linux
+          mv in/macos-release/*.dmg in/macos-release/*-macOS.zip out/macos/
+          mv in/linux-deb/*.deb in/linux-appimage/*.AppImage out/linux/
+          (cd out && find . -type f -exec sha256sum {} \; | tee SHA256SUMS.txt)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdr-desktop-${{ env.SDR_VERSION }}
+          path: out/
+          if-no-files-found: error

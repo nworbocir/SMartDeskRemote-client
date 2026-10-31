@@ -1,0 +1,8 @@
+/target/
+/flutter/build/
+/flutter/.dart_tool/
+**/ephemeral/
+/appimage/AppDir/
+/appimage/appimage-build/
+*.pdb
+.DS_Store
