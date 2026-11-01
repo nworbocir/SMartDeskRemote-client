@@ -412,7 +412,7 @@ jobs:
           set -euo pipefail
           mv SMartDeskRemote-${SDR_VERSION}-x86_64.deb appimage/rustdesk.deb
           sudo apt-get update -y
-          sudo apt-get install -y libarchive-tools libfuse2
+          sudo apt-get install -y libarchive-tools libfuse2 desktop-file-utils
           sudo pip3 install "setuptools_scm<10"
           sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
           pushd appimage
@@ -425,6 +425,15 @@ jobs:
           # Repack with the static type2 runtime, which needs no libfuse2 (absent on Ubuntu 24.04+).
           sudo rm -rf squashfs-root
           "$built" --appimage-extract >/dev/null
+          # appimagetool needs the menu entry and icon at the top of the AppDir.
+          if ! ls squashfs-root/*.desktop >/dev/null 2>&1; then
+            cp squashfs-root/usr/share/applications/rustdesk.desktop squashfs-root/rustdesk.desktop
+          fi
+          if ! ls squashfs-root/rustdesk.png squashfs-root/.DirIcon >/dev/null 2>&1; then
+            cp squashfs-root/usr/share/icons/hicolor/256x256/apps/rustdesk.png squashfs-root/rustdesk.png
+            ln -sf rustdesk.png squashfs-root/.DirIcon
+          fi
+          ls -la squashfs-root | head -20
           wget -q -O appimagetool "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage" \
             || wget -q -O appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
           chmod +x appimagetool
