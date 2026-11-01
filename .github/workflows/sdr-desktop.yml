@@ -482,7 +482,7 @@ jobs:
           mkdir -p out/macos out/linux
           mv in/macos-release/*.dmg in/macos-release/*-macOS.zip out/macos/
           mv in/linux-deb/*.deb in/linux-appimage/*.AppImage out/linux/
-          (cd out && find . -type f -exec sha256sum {} \; | tee SHA256SUMS.txt)
+          (cd out && find . -type f ! -name SHA256SUMS.txt -exec sha256sum {} \; > ../SHA256SUMS.txt && mv ../SHA256SUMS.txt . && cat SHA256SUMS.txt)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sdr-desktop-${{ env.SDR_VERSION }}
