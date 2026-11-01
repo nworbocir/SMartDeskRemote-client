@@ -383,6 +383,7 @@ jobs:
   build-appimage:
     name: Linux x86_64 (AppImage)
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     needs: [build-linux]
     if: always() && (needs.build-linux.result == 'success' || inputs.deb_from_run != '')
     steps:
@@ -432,7 +433,8 @@ jobs:
           popd
           chmod +x "SMartDeskRemote-${SDR_VERSION}-x86_64.AppImage"
           ls -l SMartDeskRemote-*.AppImage
-          ./SMartDeskRemote-${SDR_VERSION}-x86_64.AppImage --appimage-extract-and-run --version || echo "::warning::could not run --version"
+          # No display on the runner: never let the GUI binary hold the job.
+          timeout 60 ./SMartDeskRemote-${SDR_VERSION}-x86_64.AppImage --appimage-extract-and-run --version </dev/null || echo "::warning::could not run --version"
 
       - name: Upload AppImage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
